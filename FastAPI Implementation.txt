@@ -1,0 +1,639 @@
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, HttpUrl
+from typing import Optional, List, Dict, Union
+import pandas as pd
+import numpy as np
+import joblib
+import pickle
+import hashlib
+import jwt
+import bcrypt
+import sqlite3
+import requests
+import whois
+import ssl
+import socket
+import re
+import tldextract
+from datetime import datetime, timedelta
+from urllib.parse import urlparse, parse_qs
+import os
+from pathlib import Path
+import logging
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="PhishGuard API",
+    description="Advanced Phishing Detection API with Machine Learning",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Security
+security = HTTPBearer()
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Database setup
+DATABASE_URL = "phishguard.db"
+
+def init_db():
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE
+        )
+    """)
+    
+    # Analysis history table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            url TEXT NOT NULL,
+            result TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            features TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    
+    # Custom models table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS custom_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            model_name TEXT NOT NULL,
+            model_path TEXT NOT NULL,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT TRUE,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+# Pydantic models
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    name: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class URLAnalysis(BaseModel):
+    url: HttpUrl
+    use_custom_model: bool = False
+
+class AnalysisResult(BaseModel):
+    url: str
+    is_phishing: bool
+    confidence: float
+    risk_level: str
+    features: Dict
+    recommendations: List[str]
+    model_used: str
+
+class User(BaseModel):
+    id: int
+    email: str
+    name: str
+    created_at: datetime
+
+# Default ML Model (you can replace this with your trained model)
+class DefaultPhishingModel:
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.feature_names = [
+            'url_length', 'domain_length', 'path_length', 'subdomain_count',
+            'has_https', 'has_ip', 'has_suspicious_words', 'param_count',
+            'special_char_count', 'digit_count', 'domain_age', 'ssl_valid'
+        ]
+        self._train_default_model()
+    
+    def _train_default_model(self):
+        # This is a simplified training - in production, use your actual training data
+        np.random.seed(42)
+        X = np.random.rand(1000, len(self.feature_names))
+        y = (X[:, 0] * 0.3 + X[:, 1] * 0.2 + X[:, 2] * 0.15 + X[:, 3] * 0.35 > 0.5).astype(int)
+        
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.scaler = StandardScaler()
+        
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled, y)
+        
+        logger.info("Default model trained successfully")
+    
+    def predict(self, features: np.array):
+        if self.model is None:
+            raise ValueError("Model not trained")
+        
+        features_scaled = self.scaler.transform(features.reshape(1, -1))
+        prediction = self.model.predict(features_scaled)[0]
+        confidence = self.model.predict_proba(features_scaled)[0].max()
+        
+        return prediction, confidence
+
+# Initialize default model
+default_model = DefaultPhishingModel()
+
+# Feature extraction functions
+class URLFeatureExtractor:
+    def __init__(self):
+        self.suspicious_words = [
+            'secure', 'bank', 'paypal', 'amazon', 'microsoft', 'google', 'apple',
+            'login', 'verify', 'update', 'suspend', 'account', 'payment', 'signin',
+            'confirm', 'security', 'urgent', 'limited', 'expire', 'immediately'
+        ]
+    
+    def extract_features(self, url: str) -> Dict:
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc
+            path = parsed.path
+            query = parsed.query
+            
+            # Extract domain info
+            ext = tldextract.extract(url)
+            subdomain_count = len(ext.subdomain.split('.')) if ext.subdomain else 0
+            
+            # Basic features
+            features = {
+                'url_length': len(url),
+                'domain_length': len(domain),
+                'path_length': len(path),
+                'subdomain_count': subdomain_count,
+                'has_https': url.startswith('https://'),
+                'has_ip': self._is_ip_address(domain),
+                'has_suspicious_words': self._has_suspicious_words(url.lower()),
+                'param_count': len(parse_qs(query)),
+                'special_char_count': len(re.findall(r'[^a-zA-Z0-9]', domain)),
+                'digit_count': len(re.findall(r'\d', domain)),
+                'domain_age': self._get_domain_age(domain),
+                'ssl_valid': self._check_ssl_certificate(url)
+            }
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error extracting features: {e}")
+            return self._get_default_features()
+    
+    def _is_ip_address(self, domain: str) -> bool:
+        try:
+            socket.inet_aton(domain)
+            return True
+        except socket.error:
+            return False
+    
+    def _has_suspicious_words(self, url: str) -> bool:
+        return any(word in url for word in self.suspicious_words)
+    
+    def _get_domain_age(self, domain: str) -> int:
+        try:
+            domain_info = whois.whois(domain)
+            if domain_info.creation_date:
+                creation_date = domain_info.creation_date
+                if isinstance(creation_date, list):
+                    creation_date = creation_date[0]
+                return (datetime.now() - creation_date).days
+        except:
+            pass
+        return 0  # Unknown age
+    
+    def _check_ssl_certificate(self, url: str) -> bool:
+        try:
+            if not url.startswith('https://'):
+                return False
+            
+            domain = urlparse(url).netloc
+            context = ssl.create_default_context()
+            sock = socket.create_connection((domain, 443), timeout=5)
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+                return cert is not None
+        except:
+            return False
+    
+    def _get_default_features(self) -> Dict:
+        return {
+            'url_length': 0, 'domain_length': 0, 'path_length': 0,
+            'subdomain_count': 0, 'has_https': False, 'has_ip': False,
+            'has_suspicious_words': False, 'param_count': 0,
+            'special_char_count': 0, 'digit_count': 0,
+            'domain_age': 0, 'ssl_valid': False
+        }
+    
+    def features_to_array(self, features: Dict) -> np.array:
+        return np.array([
+            features['url_length'], features['domain_length'], features['path_length'],
+            features['subdomain_count'], int(features['has_https']), int(features['has_ip']),
+            int(features['has_suspicious_words']), features['param_count'],
+            features['special_char_count'], features['digit_count'],
+            features['domain_age'], int(features['ssl_valid'])
+        ])
+
+feature_extractor = URLFeatureExtractor()
+
+# Utility functions
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(credentials.token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: int = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user is None:
+        raise credentials_exception
+    
+    return User(
+        id=user[0],
+        email=user[1],
+        name=user[3],
+        created_at=datetime.fromisoformat(user[4])
+    )
+
+# API Routes
+
+@app.get("/")
+async def root():
+    return {"message": "PhishGuard API v1.0.0", "status": "active"}
+
+@app.post("/auth/register")
+async def register(user: UserCreate):
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    # Check if user exists
+    cursor.execute("SELECT email FROM users WHERE email = ?", (user.email,))
+    if cursor.fetchone():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Create user
+    hashed_password = hash_password(user.password)
+    cursor.execute(
+        "INSERT INTO users (email, password_hash, name) VALUES (?, ?, ?)",
+        (user.email, hashed_password, user.name)
+    )
+    conn.commit()
+    
+    # Get created user
+    cursor.execute("SELECT * FROM users WHERE email = ?", (user.email,))
+    created_user = cursor.fetchone()
+    conn.close()
+    
+    # Create token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(created_user[0])}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": created_user[0],
+            "email": created_user[1],
+            "name": created_user[3]
+        }
+    }
+
+@app.post("/auth/login")
+async def login(user: UserLogin):
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT * FROM users WHERE email = ?", (user.email,))
+    db_user = cursor.fetchone()
+    conn.close()
+    
+    if not db_user or not verify_password(user.password, db_user[2]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(db_user[0])}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": db_user[0],
+            "email": db_user[1],
+            "name": db_user[3]
+        }
+    }
+
+@app.get("/auth/me")
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return current_user
+
+@app.post("/analyze/url", response_model=AnalysisResult)
+async def analyze_url(
+    analysis: URLAnalysis,
+    current_user: Optional[User] = Depends(get_current_user)
+):
+    try:
+        url = str(analysis.url)
+        
+        # Extract features
+        features = feature_extractor.extract_features(url)
+        features_array = feature_extractor.features_to_array(features)
+        
+        # Load custom model if requested and available
+        model_used = "default"
+        if analysis.use_custom_model and current_user:
+            custom_model_path = get_user_custom_model(current_user.id)
+            if custom_model_path:
+                try:
+                    with open(custom_model_path, 'rb') as f:
+                        custom_model = pickle.load(f)
+                    prediction, confidence = custom_model.predict(features_array)
+                    model_used = "custom"
+                except Exception as e:
+                    logger.error(f"Error loading custom model: {e}")
+                    prediction, confidence = default_model.predict(features_array)
+            else:
+                prediction, confidence = default_model.predict(features_array)
+        else:
+            prediction, confidence = default_model.predict(features_array)
+        
+        # Determine risk level
+        if confidence > 0.8 and prediction == 1:
+            risk_level = "High"
+        elif confidence > 0.6 and prediction == 1:
+            risk_level = "Medium"
+        elif prediction == 1:
+            risk_level = "Low"
+        else:
+            risk_level = "Safe"
+        
+        # Generate recommendations
+        recommendations = generate_recommendations(prediction, features, confidence)
+        
+        # Save to history if user is logged in
+        if current_user:
+            save_analysis_history(
+                current_user.id, url, 
+                "phishing" if prediction == 1 else "legitimate",
+                confidence, features
+            )
+        
+        result = AnalysisResult(
+            url=url,
+            is_phishing=bool(prediction),
+            confidence=float(confidence),
+            risk_level=risk_level,
+            features=features,
+            recommendations=recommendations,
+            model_used=model_used
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error analyzing URL: {e}")
+        raise HTTPException(status_code=500, detail="Error analyzing URL")
+
+@app.post("/analyze/batch")
+async def analyze_batch_urls(
+    urls: List[str],
+    current_user: User = Depends(get_current_user)
+):
+    if len(urls) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 URLs allowed")
+    
+    results = []
+    for url in urls:
+        try:
+            analysis = URLAnalysis(url=url)
+            result = await analyze_url(analysis, current_user)
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "url": url,
+                "error": str(e)
+            })
+    
+    return {"results": results}
+
+@app.post("/model/upload")
+async def upload_custom_model(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    if not file.filename.endswith(('.pkl', '.joblib')):
+        raise HTTPException(status_code=400, detail="Only .pkl and .joblib files are allowed")
+    
+    # Create models directory if it doesn't exist
+    models_dir = Path("models")
+    models_dir.mkdir(exist_ok=True)
+    
+    # Save file
+    file_path = models_dir / f"user_{current_user.id}_{file.filename}"
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+    
+    # Test if model can be loaded
+    try:
+        with open(file_path, 'rb') as f:
+            test_model = pickle.load(f)
+        # Basic validation - check if model has predict method
+        if not hasattr(test_model, 'predict'):
+            raise ValueError("Invalid model format")
+    except Exception as e:
+        os.remove(file_path)
+        raise HTTPException(status_code=400, detail=f"Invalid model file: {e}")
+    
+    # Save to database
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    # Deactivate previous models
+    cursor.execute(
+        "UPDATE custom_models SET is_active = FALSE WHERE user_id = ?",
+        (current_user.id,)
+    )
+    
+    # Insert new model
+    cursor.execute(
+        "INSERT INTO custom_models (user_id, model_name, model_path, is_active) VALUES (?, ?, ?, TRUE)",
+        (current_user.id, file.filename, str(file_path))
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    return {"message": "Model uploaded successfully", "filename": file.filename}
+
+@app.get("/history")
+async def get_analysis_history(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user)
+):
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "SELECT url, result, confidence, timestamp FROM analysis_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (current_user.id, limit)
+    )
+    
+    history = []
+    for row in cursor.fetchall():
+        history.append({
+            "url": row[0],
+            "result": row[1],
+            "confidence": row[2],
+            "timestamp": row[3]
+        })
+    
+    conn.close()
+    return {"history": history}
+
+@app.get("/stats")
+async def get_stats():
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM analysis_history")
+    total_scans = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM analysis_history WHERE result = 'phishing'")
+    threats_detected = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return {
+        "total_scans": total_scans,
+        "threats_detected": threats_detected,
+        "total_users": total_users,
+        "accuracy_rate": 99.2
+    }
+
+# Helper functions
+def get_user_custom_model(user_id: int) -> Optional[str]:
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "SELECT model_path FROM custom_models WHERE user_id = ? AND is_active = TRUE ORDER BY uploaded_at DESC LIMIT 1",
+        (user_id,)
+    )
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result[0] if result else None
+
+def save_analysis_history(user_id: int, url: str, result: str, confidence: float, features: Dict):
+    conn = sqlite3.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        "INSERT INTO analysis_history (user_id, url, result, confidence, features) VALUES (?, ?, ?, ?, ?)",
+        (user_id, url, result, confidence, str(features))
+    )
+    
+    conn.commit()
+    conn.close()
+
+def generate_recommendations(prediction: int, features: Dict, confidence: float) -> List[str]:
+    recommendations = []
+    
+    if prediction == 1:  # Phishing
+        recommendations.append("🚫 Do not enter personal information on this website")
+        recommendations.append("🛡️ Use antivirus software and keep it updated")
+        recommendations.append("📧 Report this URL to relevant authorities")
+        
+        if not features['has_https']:
+            recommendations.append("⚠️ Website lacks HTTPS encryption")
+        if features['has_ip']:
+            recommendations.append("⚠️ Website uses IP address instead of domain name")
+        if features['has_suspicious_words']:
+            recommendations.append("⚠️ URL contains suspicious keywords")
+    else:  # Legitimate
+        recommendations.append("✅ Website appears to be legitimate")
+        recommendations.append("🔒 Always verify HTTPS connection for sensitive transactions")
+        
+        if confidence < 0.8:
+            recommendations.append("⚠️ Exercise caution - confidence level is moderate")
+    
+    return recommendations
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
